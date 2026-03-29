@@ -25,3 +25,46 @@ class ModelConfig:
     @property
     def d_nope(self) -> int:
         return self.d_head - self.d_rope
+
+    # ── Presets ────────────────────────────────────────────────────────
+
+    @classmethod
+    def nano(cls, vocab_size: int = 32_000):
+        """~16M params · 4 layers · for quick sanity checks (minutes on 1 GPU)."""
+        return cls(
+            vocab_size=vocab_size,
+            d_model=256, n_layers=4, n_heads=4, d_head=64,
+            d_kv_latent=128, d_q_latent=256, d_rope=32,
+            ffn_hidden=512, max_seq_len=512,
+            n_experts=4, n_active_experts=2,
+            has_shared_expert=False,
+        )
+
+    @classmethod
+    def micro(cls, vocab_size: int = 32_000):
+        """~52M params · 6 layers · for architecture validation (hours on 1 GPU)."""
+        return cls(
+            vocab_size=vocab_size,
+            d_model=384, n_layers=6, n_heads=6, d_head=64,
+            d_kv_latent=256, d_q_latent=384, d_rope=32,
+            ffn_hidden=1024, max_seq_len=1024,
+            n_experts=4, n_active_experts=2,
+            has_shared_expert=True,
+        )
+
+    @classmethod
+    def small(cls, vocab_size: int = 32_000):
+        """~220M params · 10 layers · for hyperparameter tuning (days on 1 GPU)."""
+        return cls(
+            vocab_size=vocab_size,
+            d_model=576, n_layers=10, n_heads=8, d_head=64,
+            d_kv_latent=384, d_q_latent=576, d_rope=32,
+            ffn_hidden=1536, max_seq_len=2048,
+            n_experts=6, n_active_experts=2,
+            has_shared_expert=True,
+        )
+
+    @classmethod
+    def full(cls, vocab_size: int = 32_000):
+        """~570M params · 12 layers · full-scale training run."""
+        return cls(vocab_size=vocab_size)

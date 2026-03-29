@@ -76,14 +76,15 @@ class MoELayer(nn.Module):
 
         out = out.view(B, S, D)
 
-        # Update bias (no gradients, pure heuristic)
-        if self.training:
-            with torch.no_grad():
-                tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
-                for i in range(self.n_active):
-                    tokens_per_expert.scatter_add_(
-                        0, top_indices[:, i], torch.ones(N, device=x.device)
-                    )
+        with torch.no_grad():
+            tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
+            for i in range(self.n_active):
+                tokens_per_expert.scatter_add_(
+                    0, top_indices[:, i], torch.ones(N, device=x.device)
+                )
+            self._tokens_per_expert = tokens_per_expert
+
+            if self.training:
                 target_load = N * self.n_active / self.n_experts
                 load_error = tokens_per_expert - target_load
                 self.expert_bias -= self.bias_update_speed * load_error.sign()

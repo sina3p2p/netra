@@ -27,8 +27,8 @@ def apply_rotary_emb(
     Apply RoPE to x of shape (batch, n_heads, seq_len, d_rope).
     cos/sin have shape (seq_len, d_rope // 2).
     """
-    x1 = x[:, 0::2]
-    x2 = x[:, 1::2]
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
 
     cos = cos.unsqueeze(0).unsqueeze(0)
     sin = sin.unsqueeze(0).unsqueeze(0)
