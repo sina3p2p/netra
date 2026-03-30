@@ -5,24 +5,7 @@ import torch.nn.functional as F
 from .config import ModelConfig
 from .norm import RMSNorm
 from .rope import RotaryEmbedding
-from .attention import MultiHeadLatentAttention
-from .moe import MoELayer
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.attn_norm = RMSNorm(config.d_model, eps=config.norm_eps)
-        self.attn = MultiHeadLatentAttention(config)
-        self.ffn_norm = RMSNorm(config.d_model, eps=config.norm_eps)
-        self.moe = MoELayer(config)
-
-    def forward(
-        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
-    ):
-        x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin)
-        x = x + self.moe(self.ffn_norm(x))
-        return x
+from .block import TransformerBlock
 
 
 class Netra(nn.Module):
@@ -31,14 +14,18 @@ class Netra(nn.Module):
         self.config = config
 
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.rotary = RotaryEmbedding(config.d_rope, config.max_seq_len)
+
         self.layers = nn.ModuleList(
-            [TransformerBlock(config) for _ in range(config.n_layers)]
+            [TransformerBlock(config, layer_idx=i) for i in range(config.n_layers)]
         )
+
+        # RoPE is only needed when at least one layer uses MLA
+        needs_rope = config.attention_type != "gla"
+        self.rotary = RotaryEmbedding(config.d_rope, config.max_seq_len) if needs_rope else None
+
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        # Weight tying
         self.lm_head.weight = self.tok_emb.weight
 
         self.apply(self._init_weights)
@@ -55,7 +42,9 @@ class Netra(nn.Module):
         B, S = input_ids.shape
         x = self.tok_emb(input_ids)
 
-        rope_cos, rope_sin = self.rotary(S)
+        rope_cos, rope_sin = None, None
+        if self.rotary is not None:
+            rope_cos, rope_sin = self.rotary(S)
 
         for layer in self.layers:
             x = layer(x, rope_cos, rope_sin)

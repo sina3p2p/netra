@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import ModelConfig
-from .norm import RMSNorm
-from .rope import apply_rotary_emb
+from ..config import ModelConfig
+from ..norm import RMSNorm
+from ..rope import apply_rotary_emb
 
 
 class MultiHeadLatentAttention(nn.Module):
