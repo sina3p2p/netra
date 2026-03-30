@@ -263,12 +263,10 @@ def main():
 
     use_pinmem = device.type == "cuda"
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size,
-        num_workers=4, pin_memory=use_pinmem, prefetch_factor=2,
+        train_dataset, batch_size=args.batch_size, pin_memory=use_pinmem,
     )
     eval_loader = DataLoader(
-        eval_dataset, batch_size=args.batch_size,
-        num_workers=2, pin_memory=use_pinmem, prefetch_factor=2,
+        eval_dataset, batch_size=args.batch_size, pin_memory=use_pinmem,
     )
 
     # Buffer eval batches so we can re-use them without re-streaming
