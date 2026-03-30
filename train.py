@@ -4,7 +4,7 @@ Netra pretraining script with wandb monitoring.
 
 Usage:
     python train.py --model_size nano  --tokenizer_path tokenizer.json
-    python train.py --model_size micro --max_steps 8000
+    python train.py --model_size mini --max_steps 8000
     python train.py --model_size full  --batch_size 4 --grad_accum_steps 16
 """
 
@@ -33,17 +33,17 @@ TRAIN_PRESETS = {
         batch_size=64, grad_accum_steps=1,  # eff batch = 64 × 512 = 32K tok
         max_lr=6e-4, warmup_steps=200, max_steps=9_200,
     ),
-    "micro": dict(                          # ~800M tokens (20× ~40M midpoint)
+    "mini": dict(                           # ~1.3B tokens (20× ~65M params)
         batch_size=32, grad_accum_steps=2,  # eff batch = 64 × 1024 = 64K tok
-        max_lr=4e-4, warmup_steps=400, max_steps=12_200,
+        max_lr=4e-4, warmup_steps=650, max_steps=20_000,
     ),
-    "small": dict(                          # ~3B tokens (20× ~150M midpoint)
+    "small": dict(                          # ~5.2B tokens (20× ~260M params)
         batch_size=16, grad_accum_steps=4,  # eff batch = 64 × 2048 = 128K tok
-        max_lr=3e-4, warmup_steps=800, max_steps=22_900,
+        max_lr=3e-4, warmup_steps=1_400, max_steps=40_000,
     ),
-    "full": dict(                           # ~8B tokens (20× ~400M midpoint)
+    "full": dict(                           # ~15B tokens (20× ~750M params)
         batch_size=8, grad_accum_steps=8,   # eff batch = 64 × 2048 = 128K tok
-        max_lr=2e-4, warmup_steps=1_500, max_steps=61_000,
+        max_lr=2e-4, warmup_steps=2_800, max_steps=115_000,
     ),
 }
 
@@ -147,7 +147,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Netra pretraining")
 
     p.add_argument("--model_size", type=str, default="nano",
-                    choices=["nano", "micro", "small", "full"])
+                    choices=["nano", "mini", "small", "full"])
     p.add_argument("--tokenizer_path", type=str, default="tokenizer.json")
 
     p.add_argument("--dataset_name", type=str, default="HuggingFaceFW/fineweb")

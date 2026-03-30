@@ -22,8 +22,9 @@ class ModelConfig:
     has_shared_expert: bool = True
     bias_update_speed: float = 0.001
 
-    # Attention: "mla", "gla", or "hybrid" (alternating MLA/GLA layers)
+    # Attention: "mla", "gla", or "hybrid"
     attention_type: str = "hybrid"
+    gla_every_n: int = 4  # hybrid only: 1 GLA per N layers (4 → 3:1 MLA:GLA)
 
     @property
     def d_nope(self) -> int:
@@ -46,11 +47,11 @@ class ModelConfig:
         return cls(**defaults)
 
     @classmethod
-    def micro(cls, **kwargs):
-        """~52M params · 6 layers · for architecture validation (hours on 1 GPU)."""
+    def mini(cls, **kwargs):
+        """~65M params · 8 layers (6M+2G) · architecture validation (hours on 1 GPU)."""
         defaults = dict(
             vocab_size=32_000,
-            d_model=384, n_layers=6, n_heads=6, d_head=64,
+            d_model=384, n_layers=8, n_heads=6, d_head=64,
             d_kv_latent=256, d_q_latent=384, d_rope=32,
             ffn_hidden=1024, max_seq_len=1024,
             n_experts=4, n_active_experts=2,
@@ -61,10 +62,10 @@ class ModelConfig:
 
     @classmethod
     def small(cls, **kwargs):
-        """~220M params · 10 layers · for hyperparameter tuning (days on 1 GPU)."""
+        """~260M params · 12 layers (9M+3G) · hyperparameter tuning (days on 1 GPU)."""
         defaults = dict(
             vocab_size=32_000,
-            d_model=576, n_layers=10, n_heads=8, d_head=64,
+            d_model=576, n_layers=12, n_heads=8, d_head=64,
             d_kv_latent=384, d_q_latent=576, d_rope=32,
             ffn_hidden=1536, max_seq_len=2048,
             n_experts=6, n_active_experts=2,
@@ -75,5 +76,5 @@ class ModelConfig:
 
     @classmethod
     def full(cls, **kwargs):
-        """~570M params · 12 layers · full-scale training run."""
+        """~750M params · 16 layers (12M+4G) · full-scale training run."""
         return cls(**kwargs)

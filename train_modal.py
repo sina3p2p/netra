@@ -7,7 +7,7 @@ Usage:
 
     # 2. Train the model:
     modal run train_modal.py                                     # nano (default)
-    modal run train_modal.py --model-size micro
+    modal run train_modal.py --model-size mini
     modal run train_modal.py --model-size small
     modal run train_modal.py --model-size full
 

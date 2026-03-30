@@ -12,8 +12,11 @@ def _uses_mla(config: ModelConfig, layer_idx: int) -> bool:
         return True
     if config.attention_type == "gla":
         return False
-    # hybrid: even layers → MLA, odd layers → GLA
-    return layer_idx % 2 == 0
+    # hybrid: 3:1 MLA:GLA, first and last always MLA,
+    # GLA placed in early positions of each N-layer group
+    if layer_idx == 0 or layer_idx == config.n_layers - 1:
+        return True
+    return layer_idx % config.gla_every_n != 1
 
 
 class TransformerBlock(nn.Module):
