@@ -23,7 +23,7 @@ class ModelConfig:
     bias_update_speed: float = 0.001
 
     # Attention: "mla", "gla", or "hybrid" (alternating MLA/GLA layers)
-    attention_type: str = "mla"
+    attention_type: str = "hybrid"
 
     @property
     def d_nope(self) -> int:
