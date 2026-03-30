@@ -202,6 +202,9 @@ def main():
     dtype = resolve_dtype(args.dtype)
     min_lr = args.max_lr * args.min_lr_ratio
 
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
     use_amp = device.type == "cuda"
     ctx = torch.amp.autocast(device_type="cuda", dtype=dtype) if use_amp else nullcontext()
     scaler = torch.amp.GradScaler(enabled=(use_amp and dtype == torch.float16))
