@@ -68,14 +68,16 @@ class MultiHeadLatentAttention(nn.Module):
         q = torch.cat([q_nope, q_rope], dim=-1)
         k = torch.cat([k_nope, k_rope], dim=-1)
 
-        # Causal attention
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        causal_mask = torch.triu(
-            torch.full((S, S), float("-inf"), device=x.device), diagonal=1
-        )
-        attn_weights = attn_weights + causal_mask
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        # Causal attention (old)
+        # attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        # causal_mask = torch.triu(
+        #     torch.full((S, S), float("-inf"), device=x.device), diagonal=1
+        # )
+        # attn_weights = attn_weights + causal_mask
+        # attn_weights = F.softmax(attn_weights, dim=-1)
 
-        out = torch.matmul(attn_weights, v)
+        # out = torch.matmul(attn_weights, v)
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         out = out.transpose(1, 2).contiguous().view(B, S, -1)
         return self.W_o(out)

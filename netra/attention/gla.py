@@ -36,6 +36,12 @@ class GatedLinearAttention(nn.Module):
 
         self.group_norm = nn.GroupNorm(config.n_heads, d_inner)
 
+        causal = torch.triu(
+            torch.full((config.max_seq_len, config.max_seq_len), float("-inf")),
+            diagonal=1,
+        )
+        self.register_buffer("causal_mask", causal, persistent=False)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, _ = x.shape
         H, D = self.n_heads, self.d_head
@@ -56,10 +62,7 @@ class GatedLinearAttention(nn.Module):
         # decay[i,j] = exp(cum_log[i] - cum_log[j]),  ∈ [0, 1] for j ≤ i
         decay = cum_log - cum_log.transpose(2, 3)           # (B, H, S, S)
 
-        causal_mask = torch.triu(
-            torch.full((S, S), float("-inf"), device=x.device), diagonal=1
-        )
-        decay = torch.exp(decay + causal_mask)
+        decay = torch.exp(decay + self.causal_mask[:S, :S])
 
         # Gated linear attention
         attn = torch.matmul(q, k.transpose(-2, -1)) * decay

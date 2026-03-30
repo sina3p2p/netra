@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +8,8 @@ from .config import ModelConfig
 from .norm import RMSNorm
 from .rope import RotaryEmbedding
 from .block import TransformerBlock
+
+_RESIDUAL_PROJ_NAMES = {"W_o", "w_down"}
 
 
 class Netra(nn.Module):
@@ -29,6 +33,7 @@ class Netra(nn.Module):
         self.lm_head.weight = self.tok_emb.weight
 
         self.apply(self._init_weights)
+        self._apply_residual_scaling()
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -37,6 +42,15 @@ class Netra(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _apply_residual_scaling(self):
+        """Scale residual output projections (W_o, w_down) by 1/sqrt(2*n_layers)."""
+        scale = 1.0 / math.sqrt(2.0 * self.config.n_layers)
+        for name, param in self.named_parameters():
+            parts = name.split(".")
+            leaf = parts[-2] if len(parts) >= 2 else ""
+            if leaf in _RESIDUAL_PROJ_NAMES and parts[-1] == "weight":
+                param.data.mul_(scale)
 
     def forward(self, input_ids: torch.Tensor, targets: torch.Tensor = None):
         B, S = input_ids.shape

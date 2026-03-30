@@ -63,7 +63,7 @@ def train_tokenizer(num_samples: int = 500_000):
 
 @app.function(
     image=image,
-    gpu="A100",
+    gpu="H100",
     volumes={VOLUME_PATH: volume},
     secrets=secrets,
     timeout=24 * 3600,

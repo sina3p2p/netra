@@ -59,17 +59,28 @@ class MoELayer(nn.Module):
         top_weights = router_probs.gather(dim=-1, index=top_indices)
         top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True)
 
-        # Dispatch tokens to experts
-        out = torch.zeros_like(flat_x)
-        for i in range(self.n_active):
-            expert_idx = top_indices[:, i]
-            weight = top_weights[:, i]
+        # Flatten all (token, expert) assignments and sort by expert
+        # for contiguous batched dispatch — no nested Python loops
+        token_ids = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, self.n_active).reshape(-1)
+        flat_expert_ids = top_indices.view(-1)
+        flat_weights = top_weights.view(-1)
 
-            for e in range(self.n_experts):
-                mask = expert_idx == e
-                if mask.any():
-                    expert_out = self.experts[e](flat_x[mask])
-                    out[mask] += weight[mask].unsqueeze(-1) * expert_out
+        sorted_expert_ids, sort_order = flat_expert_ids.sort()
+        sorted_token_ids = token_ids[sort_order]
+        sorted_weights = flat_weights[sort_order]
+
+        splits = torch.bincount(sorted_expert_ids, minlength=self.n_experts).cpu().tolist()
+
+        out = torch.zeros_like(flat_x)
+        start = 0
+        for e, count in enumerate(splits):
+            if count == 0:
+                continue
+            end = start + count
+            tids = sorted_token_ids[start:end]
+            w = sorted_weights[start:end].unsqueeze(-1)
+            out.index_add_(0, tids, w * self.experts[e](flat_x[tids]))
+            start = end
 
         if self.shared_expert is not None:
             out = out + self.shared_expert(flat_x)
