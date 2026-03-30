@@ -93,6 +93,7 @@ def train(model_size: str = "nano", extra_args: str = ""):
         "--model_size", model_size,
         "--tokenizer_path", tok_local,
         "--checkpoint_dir", ckpt_dir,
+        "--compile"
     ]
     if extra_args:
         cmd.extend(extra_args.split())
