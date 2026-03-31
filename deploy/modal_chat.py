@@ -48,7 +48,7 @@ class Model:
         self.model = Netra(config).to("cuda")
         self.model.load_state_dict(ckpt["model"])
         self.model.eval()
-        self.max_seq_len = config.max_seq_len
+        self.n_layers = len(self.model.layers)
         print(f"Model loaded: {sum(p.numel() for p in self.model.parameters()):,} params")
 
     @modal.fastapi_endpoint(method="POST")
@@ -64,9 +64,10 @@ class Model:
         ).unsqueeze(0)
 
         with self.torch.no_grad():
+            cache = [{} for _ in range(self.n_layers)]
+            logits, _ = self.model(ids, cache=cache)
+
             for _ in range(max_tokens):
-                inp = ids[:, -self.max_seq_len:]
-                logits, _ = self.model(inp)
                 next_logits = logits[:, -1, :]
 
                 if rep_penalty != 1.0:
@@ -85,6 +86,7 @@ class Model:
                 ids = self.torch.cat([ids, next_id], dim=1)
                 if next_id.item() == self.tokenizer.eot_id:
                     break
+                logits, _ = self.model(next_id, cache=cache)
 
         text = self.tokenizer.decode(ids[0].tolist())
         return {"text": text}

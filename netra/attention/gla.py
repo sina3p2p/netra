@@ -42,7 +42,7 @@ class GatedLinearAttention(nn.Module):
         )
         self.register_buffer("causal_mask", causal, persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: dict | None = None) -> torch.Tensor:
         B, S, _ = x.shape
         H, D = self.n_heads, self.d_head
 
@@ -53,24 +53,35 @@ class GatedLinearAttention(nn.Module):
         q = F.silu(q)
         k = F.silu(k)
 
-        # Forget gates in log-space: log(α) ∈ (-∞, 0]
-        log_alpha = -F.softplus(self.W_alpha(x))           # (B, S, H)
+        log_alpha = -F.softplus(self.W_alpha(x))            # (B, S, H)
         log_alpha = log_alpha.transpose(1, 2).unsqueeze(-1) # (B, H, S, 1)
 
-        # Cumulative log-gates → pairwise decay matrix
-        cum_log = torch.cumsum(log_alpha, dim=2)            # (B, H, S, 1)
-        # decay[i,j] = exp(cum_log[i] - cum_log[j]),  ∈ [0, 1] for j ≤ i
-        decay = cum_log - cum_log.transpose(2, 3)           # (B, H, S, S)
+        if cache is not None:
+            out = self._recurrent(q, k, v, log_alpha, cache)
+        else:
+            cum_log = torch.cumsum(log_alpha, dim=2)
+            decay = cum_log - cum_log.transpose(2, 3)
+            decay = torch.exp(decay + self.causal_mask[:S, :S])
+            attn = torch.matmul(q, k.transpose(-2, -1)) * decay
+            out = torch.matmul(attn, v)
 
-        decay = torch.exp(decay + self.causal_mask[:S, :S])
-
-        # Gated linear attention
-        attn = torch.matmul(q, k.transpose(-2, -1)) * decay
-        out = torch.matmul(attn, v)                         # (B, H, S, D)
-
-        # Per-head GroupNorm + output gate
         out = out.transpose(1, 2).contiguous().view(B, S, H * D)
         out = self.group_norm(out.transpose(1, 2)).transpose(1, 2)
         out = out * torch.sigmoid(self.W_gate(x))
 
         return self.W_o(out)
+
+    def _recurrent(self, q, k, v, log_alpha, cache):
+        """Recurrent form for cached inference: h_t = α_t·h_{t-1} + k_t⊗v_t."""
+        B, H, S, D = q.shape
+        alpha = torch.exp(log_alpha)                        # (B, H, S, 1)
+
+        h = cache.get("h", torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype))
+        outputs = []
+        for t in range(S):
+            h = alpha[:, :, t, :] * h + torch.einsum("bhd,bhe->bhde", k[:, :, t], v[:, :, t])
+            o_t = torch.einsum("bhd,bhde->bhe", q[:, :, t], h)
+            outputs.append(o_t)
+        cache["h"] = h
+
+        return torch.stack(outputs, dim=2)

@@ -47,37 +47,34 @@ class MultiHeadLatentAttention(nn.Module):
         self.W_o = nn.Linear(config.n_heads * config.d_head, config.d_model, bias=False)
 
     def forward(
-        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
+        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor,
+        cache: dict | None = None,
     ) -> torch.Tensor:
         B, S, _ = x.shape
 
-        # Q: compress -> expand -> split nope + rope portions
         q_latent = self.q_norm(self.W_dq(x))
         q_nope = self.W_uq(q_latent).view(B, S, self.n_heads, self.d_nope).transpose(1, 2)
         q_rope = self.W_qr(q_latent).view(B, S, self.n_heads, self.d_rope).transpose(1, 2)
         q_rope = apply_rotary_emb(q_rope, rope_cos, rope_sin)
 
-        # KV: compress -> expand
         kv_latent = self.kv_norm(self.W_dkv(x))
         k_nope = self.W_uk(kv_latent).view(B, S, self.n_heads, self.d_nope).transpose(1, 2)
         k_rope = self.W_kr(kv_latent).view(B, S, self.n_heads, self.d_rope).transpose(1, 2)
         k_rope = apply_rotary_emb(k_rope, rope_cos, rope_sin)
         v = self.W_uv(kv_latent).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Reassemble full Q and K
         q = torch.cat([q_nope, q_rope], dim=-1)
         k = torch.cat([k_nope, k_rope], dim=-1)
 
-        # Causal attention (old)
-        # attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        # causal_mask = torch.triu(
-        #     torch.full((S, S), float("-inf"), device=x.device), diagonal=1
-        # )
-        # attn_weights = attn_weights + causal_mask
-        # attn_weights = F.softmax(attn_weights, dim=-1)
+        if cache is not None:
+            if "k" in cache:
+                k = torch.cat([cache["k"], k], dim=2)
+                v = torch.cat([cache["v"], v], dim=2)
+            cache["k"] = k
+            cache["v"] = v
 
-        # out = torch.matmul(attn_weights, v)
-
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
+        out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=(cache is None), scale=self.scale,
+        )
         out = out.transpose(1, 2).contiguous().view(B, S, -1)
         return self.W_o(out)

@@ -32,10 +32,11 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.d_model, eps=config.norm_eps)
         self.moe = MoELayer(config)
 
-    def forward(self, x: torch.Tensor, rope_cos=None, rope_sin=None):
+    def forward(self, x: torch.Tensor, rope_cos=None, rope_sin=None,
+                cache: dict | None = None):
         if self.use_mla:
-            x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin)
+            x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin, cache=cache)
         else:
-            x = x + self.attn(self.attn_norm(x))
+            x = x + self.attn(self.attn_norm(x), cache=cache)
         x = x + self.moe(self.ffn_norm(x))
         return x

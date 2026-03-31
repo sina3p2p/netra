@@ -52,16 +52,23 @@ class Netra(nn.Module):
             if leaf in _RESIDUAL_PROJ_NAMES and parts[-1] == "weight":
                 param.data.mul_(scale)
 
-    def forward(self, input_ids: torch.Tensor, targets: torch.Tensor = None):
+    def forward(self, input_ids: torch.Tensor, targets: torch.Tensor = None,
+                cache: list[dict] | None = None):
         B, S = input_ids.shape
         x = self.tok_emb(input_ids)
 
         rope_cos, rope_sin = None, None
         if self.rotary is not None:
-            rope_cos, rope_sin = self.rotary(S)
+            offset = cache[0].get("_seen", 0) if cache else 0
+            rope_cos, rope_sin = self.rotary(S, offset=offset)
 
-        for layer in self.layers:
-            x = layer(x, rope_cos, rope_sin)
+        for i, layer in enumerate(self.layers):
+            layer_cache = cache[i] if cache is not None else None
+            x = layer(x, rope_cos, rope_sin, cache=layer_cache)
+
+        if cache is not None:
+            prev = cache[0].get("_seen", 0)
+            cache[0]["_seen"] = prev + S
 
         x = self.norm(x)
         logits = self.lm_head(x)

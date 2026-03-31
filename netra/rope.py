@@ -16,8 +16,9 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
 
-    def forward(self, seq_len: int):
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+    def forward(self, seq_len: int, offset: int = 0):
+        return (self.cos_cached[offset:offset + seq_len],
+                self.sin_cached[offset:offset + seq_len])
 
 
 def apply_rotary_emb(
