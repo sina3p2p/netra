@@ -1,0 +1,33 @@
+# Netra nano — ~16M params · quick sanity checks (minutes on 1 GPU)
+# Usage: python train.py --config configs/nano.yaml
+
+model:
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  d_head: 64
+  d_kv_latent: 128
+  d_q_latent: 256
+  d_rope: 32
+  ffn_hidden: 512
+  max_seq_len: 512
+  n_experts: 4
+  n_active_experts: 2
+  has_shared_expert: false
+
+training:
+  batch_size: 64
+  grad_accum_steps: 1
+  max_lr: 6.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 200
+  max_steps: 9200
+
+eval:
+  eval_interval: 500
+  eval_steps: 20
+  generate_interval: 500
+
+logging:
+  log_interval: 10
+  save_interval: 1000

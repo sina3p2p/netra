@@ -75,6 +75,20 @@ class ModelConfig:
         return cls(**defaults)
 
     @classmethod
+    def medium(cls, **kwargs):
+        """~900M params · 16 layers (12M+4G) · serious pretraining (days on 8 GPUs)."""
+        defaults = dict(
+            vocab_size=32_000,
+            d_model=1024, n_layers=16, n_heads=16, d_head=64,
+            d_kv_latent=512, d_q_latent=1024, d_rope=32,
+            ffn_hidden=2560, max_seq_len=2048,
+            n_experts=8, n_active_experts=2,
+            has_shared_expert=True,
+        )
+        defaults.update(kwargs)
+        return cls(**defaults)
+
+    @classmethod
     def full(cls, **kwargs):
-        """~750M params · 16 layers (12M+4G) · full-scale training run."""
+        """~2B+ params · 24 layers · full-scale training run."""
         return cls(**kwargs)

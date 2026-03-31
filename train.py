@@ -6,14 +6,14 @@ Supports single-GPU and multi-GPU (DDP) training.
 
 Usage:
     # Single GPU
-    python train.py --model_size nano --tokenizer_path tokenizer.json
+    python train.py --config configs/nano.yaml
 
     # Multi-GPU (4 GPUs on one machine)
-    torchrun --nproc_per_node=4 train.py --model_size small
+    torchrun --nproc_per_node=4 train.py --config configs/small.yaml
 
-    # Multi-node (2 nodes × 4 GPUs)
-    torchrun --nnodes=2 --nproc_per_node=4 --rdzv_backend=c10d \\
-        --rdzv_endpoint=HOST:PORT train.py --model_size full
+    # Multi-GPU with R2 backup
+    torchrun --nproc_per_node=8 train.py --config configs/medium.yaml \\
+        --data_path tokens.bin --r2_bucket netra-checkpoints
 """
 
 import argparse
@@ -37,26 +37,15 @@ from datasets import load_dataset
 from netra import ModelConfig, Netra, NetraTokenizer
 from netra.data import MemmapTokenDataset, StreamingTokenDataset
 
-# ── Training presets per model size ───────────────────────────────────
-
-TRAIN_PRESETS = {
-    "nano": dict(                           # ~300M tokens (20× ~16M params)
-        batch_size=64, grad_accum_steps=1,  # eff batch = 64 × 512 = 32K tok
-        max_lr=6e-4, warmup_steps=200, max_steps=9_200,
-    ),
-    "mini": dict(                           # ~1.3B tokens (20× ~65M params)
-        batch_size=32, grad_accum_steps=2,  # eff batch = 64 × 1024 = 64K tok
-        max_lr=4e-4, warmup_steps=650, max_steps=20_000,
-    ),
-    "small": dict(                          # ~6.7B tokens (20× ~334M params)
-        batch_size=16, grad_accum_steps=4,  # eff batch = 64 × 2048 = 128K tok
-        max_lr=3e-4, warmup_steps=1_700, max_steps=51_000,
-    ),
-    "full": dict(                           # ~15B tokens (20× ~750M params)
-        batch_size=8, grad_accum_steps=8,   # eff batch = 64 × 2048 = 128K tok
-        max_lr=2e-4, warmup_steps=2_800, max_steps=115_000,
-    ),
-}
+WEIGHT_DECAY = 0.1
+GRAD_CLIP = 1.0
+BETA1 = 0.9
+BETA2 = 0.95
+NUM_WORKERS = 4
+GENERATE_MAX_TOKENS = 100
+DTYPE = "bfloat16"
+DATASET_NAME = "HuggingFaceFW/fineweb"
+DATASET_SUBSET = "sample-10BT"
 
 # ── DDP helpers ───────────────────────────────────────────────────────
 
@@ -166,7 +155,8 @@ def evaluate(model, eval_batches, device, ctx):
     return total_loss / max(len(eval_batches), 1)
 
 
-def save_checkpoint(model, optimizer, step, model_config, path):
+def save_checkpoint(model, optimizer, step, model_config, path,
+                    r2_bucket=None, keep_local=True):
     raw = get_raw_model(model)
     torch.save({
         "model": raw.state_dict(),
@@ -175,58 +165,72 @@ def save_checkpoint(model, optimizer, step, model_config, path):
         "model_config": asdict(model_config),
     }, path)
 
+    if r2_bucket:
+        try:
+            import boto3
+            s3 = boto3.client("s3",
+                endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
+                aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"),
+            )
+            key = f"checkpoints/{Path(path).name}"
+            s3.upload_file(str(path), r2_bucket, key)
+            print(f"  ↳ uploaded to r2://{r2_bucket}/{key}")
+            if not keep_local:
+                Path(path).unlink()
+                print(f"  ↳ deleted local {path}")
+        except Exception as e:
+            print(f"  ⚠ R2 upload failed: {e} (local copy kept)")
 
-# ── Argument parsing ──────────────────────────────────────────────────
+
+# ── Config & argument parsing ─────────────────────────────────────────
+
+
+def load_config(path: str) -> dict:
+    """Load a YAML config file."""
+    import yaml
+    with open(path) as f:
+        return yaml.safe_load(f)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Netra pretraining")
 
-    p.add_argument("--model_size", type=str, default="nano",
-                    choices=["nano", "mini", "small", "full"])
+    p.add_argument("--config", type=str, required=True,
+                   help="Path to YAML config (e.g. configs/medium.yaml)")
     p.add_argument("--tokenizer_path", type=str, default="tokenizer.json")
-
-    p.add_argument("--dataset_name", type=str, default="HuggingFaceFW/fineweb")
-    p.add_argument("--dataset_subset", type=str, default="sample-10BT")
     p.add_argument("--data_path", type=str, default=None,
-                    help="Path to pre-tokenized tokens.bin (skips streaming if set)")
-
-    p.add_argument("--batch_size", type=int, default=None)
-    p.add_argument("--grad_accum_steps", type=int, default=None)
-    p.add_argument("--max_lr", type=float, default=None)
-    p.add_argument("--min_lr_ratio", type=float, default=0.1)
-    p.add_argument("--warmup_steps", type=int, default=None)
-    p.add_argument("--max_steps", type=int, default=None)
-    p.add_argument("--weight_decay", type=float, default=0.1)
-    p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--beta1", type=float, default=0.9)
-    p.add_argument("--beta2", type=float, default=0.95)
-
-    p.add_argument("--device", type=str, default="auto")
-    p.add_argument("--dtype", type=str, default="bfloat16",
-                    choices=["float32", "float16", "bfloat16"])
-    p.add_argument("--compile", action="store_true")
-
-    p.add_argument("--wandb_project", type=str, default="netra")
-    p.add_argument("--wandb_run_name", type=str, default=None)
-    p.add_argument("--no_wandb", action="store_true")
-    p.add_argument("--log_interval", type=int, default=10)
-    p.add_argument("--eval_interval", type=int, default=500)
-    p.add_argument("--eval_steps", type=int, default=20)
-    p.add_argument("--save_interval", type=int, default=1000)
-    p.add_argument("--generate_interval", type=int, default=500)
-    p.add_argument("--generate_max_tokens", type=int, default=100)
-
-    p.add_argument("--num_workers", type=int, default=4)
+                   help="Path to pre-tokenized tokens.bin (skips streaming)")
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--resume_from", type=str, default=None)
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--no_wandb", action="store_true")
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--r2_bucket", type=str, default=None,
+                   help="Cloudflare R2 bucket for checkpoint backup")
+    p.add_argument("--keep_local_ckpt", action="store_true", default=False,
+                   help="Keep local checkpoint after R2 upload (default: delete)")
 
     args = p.parse_args()
 
-    preset = TRAIN_PRESETS[args.model_size]
-    for key, value in preset.items():
-        if getattr(args, key) is None:
-            setattr(args, key, value)
+    cfg = load_config(args.config)
+    args._model_cfg = cfg.get("model", {})
+
+    t = cfg.get("training", {})
+    args.batch_size = t["batch_size"]
+    args.grad_accum_steps = t["grad_accum_steps"]
+    args.max_lr = t["max_lr"]
+    args.min_lr_ratio = t.get("min_lr_ratio", 0.1)
+    args.warmup_steps = t["warmup_steps"]
+    args.max_steps = t["max_steps"]
+    e = cfg.get("eval", {})
+    args.eval_interval = e.get("eval_interval", 500)
+    args.eval_steps = e.get("eval_steps", 20)
+    args.generate_interval = e.get("generate_interval", 500)
+
+    log = cfg.get("logging", {})
+    args.log_interval = log.get("log_interval", 10)
+    args.save_interval = log.get("save_interval", 1000)
 
     return args
 
@@ -240,7 +244,6 @@ def main():
     is_main = rank == 0
     ddp = world_size > 1
 
-    # Scale steps down by world_size to keep the same total token budget
     if world_size > 1:
         args.max_steps = max(args.max_steps // world_size, 1)
         args.warmup_steps = max(args.warmup_steps // world_size, 1)
@@ -250,15 +253,13 @@ def main():
 
     if ddp:
         device = torch.device(f"cuda:{local_rank}")
-    elif args.device != "auto":
-        device = torch.device(args.device)
     elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    dtype = resolve_dtype(args.dtype)
+    dtype = resolve_dtype(DTYPE)
     min_lr = args.max_lr * args.min_lr_ratio
 
     if device.type == "cuda":
@@ -274,7 +275,7 @@ def main():
     if not tok_path.exists():
         raise FileNotFoundError(
             f"Tokenizer not found at {tok_path}. "
-            "Train one first with NetraTokenizer.train() (see notebooks/main.ipynb)."
+            "Train one first: python tools/train_tokenizer.py"
         )
     tokenizer = NetraTokenizer.from_file(tok_path)
     if is_main:
@@ -282,14 +283,16 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────
 
-    model_config = getattr(ModelConfig, args.model_size)(vocab_size=tokenizer.vocab_size)
+    model_cfg_dict = dict(args._model_cfg, vocab_size=tokenizer.vocab_size)
+    model_config = ModelConfig(**model_cfg_dict)
     model = Netra(model_config).to(device)
     n_params = count_parameters(model)
+    config_name = Path(args.config).stem
     if is_main:
-        print(f"Model: {args.model_size} | {n_params:,} params | "
+        print(f"Model: {config_name} | {n_params:,} params | "
               f"device: {device} | world_size: {world_size}")
 
-    # ── Resume (before DDP wrap) ────────────────────────────────────────
+    # ── Resume (before DDP wrap) ──────────────────────────────────────
 
     start_step = 0
     if args.resume_from:
@@ -321,9 +324,9 @@ def main():
 
     use_fused = device.type == "cuda" and "fused" in inspect.signature(torch.optim.AdamW).parameters
     optimizer = torch.optim.AdamW([
-        {"params": decay, "weight_decay": args.weight_decay},
+        {"params": decay, "weight_decay": WEIGHT_DECAY},
         {"params": no_decay, "weight_decay": 0.0},
-    ], lr=args.max_lr, betas=(args.beta1, args.beta2), fused=use_fused)
+    ], lr=args.max_lr, betas=(BETA1, BETA2), fused=use_fused)
 
     if args.resume_from and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -333,7 +336,7 @@ def main():
     # ── Data ──────────────────────────────────────────────────────────
 
     use_pinmem = device.type == "cuda"
-    persist = args.num_workers > 0
+    persist = NUM_WORKERS > 0
 
     if args.data_path and os.path.exists(args.data_path):
         if is_main:
@@ -359,12 +362,12 @@ def main():
             print("Initialising data streams …")
 
         train_ds = load_dataset(
-            args.dataset_name, args.dataset_subset,
+            DATASET_NAME, DATASET_SUBSET,
             split="train", streaming=True,
         ).shuffle(seed=0, buffer_size=10_000)
 
         eval_ds = load_dataset(
-            args.dataset_name, args.dataset_subset,
+            DATASET_NAME, DATASET_SUBSET,
             split="train", streaming=True,
         ).shuffle(seed=42, buffer_size=10_000)
 
@@ -378,7 +381,7 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
-        num_workers=args.num_workers, pin_memory=use_pinmem,
+        num_workers=NUM_WORKERS, pin_memory=use_pinmem,
         persistent_workers=persist,
     )
     eval_loader = DataLoader(
@@ -402,9 +405,9 @@ def main():
     eff_batch_tokens = args.batch_size * args.grad_accum_steps * world_size * model_config.max_seq_len
 
     if is_main:
-        run_name = args.wandb_run_name or f"netra-{args.model_size}"
+        run_name = args.wandb_run_name or f"netra-{config_name}"
         wandb.init(
-            project=args.wandb_project,
+            project="netra",
             name=run_name,
             mode="disabled" if args.no_wandb else "online",
             config={
@@ -418,9 +421,9 @@ def main():
                 "min_lr": min_lr,
                 "warmup_steps": args.warmup_steps,
                 "max_steps": args.max_steps,
-                "weight_decay": args.weight_decay,
-                "grad_clip": args.grad_clip,
-                "dtype": args.dtype,
+                "weight_decay": WEIGHT_DECAY,
+                "grad_clip": GRAD_CLIP,
+                "dtype": DTYPE,
                 "device": str(device),
             },
         )
@@ -460,7 +463,6 @@ def main():
 
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-            # Skip all-reduce on non-final micro-steps for efficiency
             is_last_micro = micro_step == args.grad_accum_steps - 1
             sync_ctx = nullcontext() if (not ddp or is_last_micro) else model.no_sync()
 
@@ -473,7 +475,7 @@ def main():
             step_loss += loss.item()
 
         scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         scaler.step(optimizer)
         scaler.update()
 
@@ -519,7 +521,7 @@ def main():
             prompts = ["The meaning of life is", "Once upon a time", "In 2025,"]
             table = wandb.Table(columns=["step", "prompt", "generation"])
             for p in prompts:
-                text = generate(model, tokenizer, p, args.generate_max_tokens, device=device)
+                text = generate(model, tokenizer, p, GENERATE_MAX_TOKENS, device=device)
                 table.add_data(step + 1, p, text)
                 print(f"  ↳ [{p}] → {text[:120]}")
             wandb.log({"samples": table}, step=step + 1)
@@ -528,14 +530,17 @@ def main():
 
         if is_main and (step + 1) % args.save_interval == 0:
             ckpt_path = Path(args.checkpoint_dir) / f"step_{step+1}.pt"
-            save_checkpoint(model, optimizer, step + 1, model_config, ckpt_path)
+            save_checkpoint(model, optimizer, step + 1, model_config, ckpt_path,
+                            r2_bucket=args.r2_bucket,
+                            keep_local=args.keep_local_ckpt)
             print(f"  ↳ checkpoint saved → {ckpt_path}")
 
     # ── Final save ────────────────────────────────────────────────────
 
     if is_main:
         final_path = Path(args.checkpoint_dir) / "final.pt"
-        save_checkpoint(model, optimizer, args.max_steps, model_config, final_path)
+        save_checkpoint(model, optimizer, args.max_steps, model_config, final_path,
+                        r2_bucket=args.r2_bucket, keep_local=True)
         print(f"\nTraining complete. Final checkpoint → {final_path}")
         wandb.finish()
 

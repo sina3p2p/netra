@@ -3,3 +3,6 @@ checkpoints/
 __pycache__/
 *.pyc
 wandb/
+tokens.bin
+tokenizer.json
+training.log

@@ -3,22 +3,19 @@ Run Netra training on Modal with cloud GPU(s).
 
 Usage:
     # 1. Train tokenizer first (only once):
-    modal run train_modal.py::train_tokenizer
+    modal run scripts/modal_train.py::train_tokenizer
 
     # 2. Pre-tokenize dataset (only once, ~30-60 min):
-    modal run train_modal.py::tokenize_dataset
+    modal run scripts/modal_train.py::tokenize_dataset
 
-    # 3. Train the model (single GPU):
-    modal run train_modal.py --model-size small
+    # 3. Train the model:
+    modal run scripts/modal_train.py --config medium
 
     # 4. Multi-GPU training:
-    NETRA_GPUS=4 modal run train_modal.py --model-size small
+    NETRA_GPUS=4 modal run scripts/modal_train.py --config medium
 
-    # 5. Run in background (safe to close terminal):
-    modal run --detach train_modal.py --model-size small
-
-    # Pass extra flags to train.py:
-    NETRA_GPUS=4 modal run train_modal.py --model-size small --extra "--max_steps 500"
+    # 5. Run in background:
+    modal run --detach scripts/modal_train.py --config medium
 """
 
 import os
@@ -32,6 +29,8 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install_from_requirements("requirements.txt")
     .add_local_dir("netra", remote_path="/root/netra/netra")
+    .add_local_dir("configs", remote_path="/root/netra/configs")
+    .add_local_dir("tools", remote_path="/root/netra/tools")
     .add_local_file("train.py", remote_path="/root/netra/train.py")
 )
 
@@ -73,20 +72,25 @@ def train_tokenizer(num_samples: int = 500_000):
 @app.function(
     image=image,
     cpu=8,
-    memory=65536,
+    memory=131072,
+    ephemeral_disk=1000_000,
     volumes={VOLUME_PATH: volume},
     secrets=secrets,
-    timeout=6 * 3600,
+    timeout=12 * 3600,
 )
 def tokenize_dataset(
     dataset_name: str = "HuggingFaceFW/fineweb",
-    dataset_subset: str = "sample-10BT",
+    dataset_subset: str = "sample-100BT",
+    max_tokens_b: float = 22.5,
     num_proc: int = 8,
 ):
-    """Pre-tokenize the full dataset to a flat uint16 binary file on the Modal volume."""
+    """Pre-tokenize the dataset to a flat uint16 binary file on the Modal volume."""
     import sys
     import numpy as np
     sys.path.insert(0, "/root/netra")
+
+    os.environ["HF_HOME"] = "/tmp/hf_cache"
+    os.environ["HF_DATASETS_CACHE"] = "/tmp/hf_cache/datasets"
 
     from datasets import load_dataset
     from tokenizers import Tokenizer
@@ -95,14 +99,17 @@ def tokenize_dataset(
     if not os.path.exists(tok_path):
         raise FileNotFoundError(
             "No tokenizer found. Run first:\n"
-            "  modal run train_modal.py::train_tokenizer"
+            "  modal run scripts/modal_train.py::train_tokenizer"
         )
     tokenizer = Tokenizer.from_file(tok_path)
     eot_id = tokenizer.token_to_id("<|EOT|>")
 
+    max_tokens = int(max_tokens_b * 1e9) if max_tokens_b > 0 else 0
+
     out_path = f"{VOLUME_PATH}/tokens.bin"
-    print(f"Tokenizing {dataset_name}/{dataset_subset} → {out_path}")
-    print(f"Downloading dataset (non-streaming) …")
+    limit_str = f" (capped at {max_tokens_b:.0f}B tokens)" if max_tokens else ""
+    print(f"Tokenizing {dataset_name}/{dataset_subset} → {out_path}{limit_str}")
+    print("Downloading dataset (non-streaming) …")
 
     ds = load_dataset(dataset_name, dataset_subset, split="train")
     print(f"Downloaded {len(ds):,} documents")
@@ -130,6 +137,7 @@ def tokenize_dataset(
     total_tokens = 0
     buf = np.empty(2**20, dtype=np.uint16)
     buf_pos = 0
+    stopped_early = False
 
     with open(out_path, "wb") as f:
         for i, row in enumerate(tokenized):
@@ -141,12 +149,19 @@ def tokenize_dataset(
                     total_tokens += buf_pos
                     buf_pos = 0
 
+            if max_tokens and (total_tokens + buf_pos) >= max_tokens:
+                stopped_early = True
+                break
+
             if (i + 1) % 2_000_000 == 0:
                 print(f"  {i+1:>12,} rows │ {(total_tokens + buf_pos) / 1e9:.2f}B tokens")
 
         if buf_pos > 0:
             f.write(buf[:buf_pos].tobytes())
             total_tokens += buf_pos
+
+    if stopped_early:
+        print(f"Reached {max_tokens_b:.0f}B token cap — stopping early")
 
     size_gb = os.path.getsize(out_path) / (1024**3)
     print(f"Done: {total_tokens:,} tokens ({size_gb:.1f} GB)")
@@ -160,9 +175,9 @@ def tokenize_dataset(
     secrets=secrets,
     timeout=24 * 3600,
 )
-def train(model_size: str = "nano", extra_args: str = ""):
+def train(config: str = "nano", extra_args: str = ""):
     """Run Netra pretraining on cloud GPU(s). Uses torchrun for multi-GPU."""
-    import subprocess, shutil, os, torch
+    import subprocess, shutil, torch
 
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "0"
     os.chdir("/root/netra")
@@ -175,16 +190,17 @@ def train(model_size: str = "nano", extra_args: str = ""):
     else:
         raise FileNotFoundError(
             "No tokenizer found. Run first:\n"
-            "  modal run train_modal.py::train_tokenizer"
+            "  modal run scripts/modal_train.py::train_tokenizer"
         )
 
-    ckpt_dir = f"{VOLUME_PATH}/checkpoints/{model_size}"
+    ckpt_dir = f"{VOLUME_PATH}/checkpoints/{config}"
     os.makedirs(ckpt_dir, exist_ok=True)
 
     data_path = f"{VOLUME_PATH}/tokens.bin"
+    config_path = f"configs/{config}.yaml"
 
     train_args = [
-        "--model_size", model_size,
+        "--config", config_path,
         "--tokenizer_path", tok_local,
         "--checkpoint_dir", ckpt_dir,
         "--compile",
@@ -217,8 +233,8 @@ def train(model_size: str = "nano", extra_args: str = ""):
 
 
 @app.local_entrypoint()
-def main(model_size: str = "nano", extra: str = ""):
-    print(f"Launching Netra training: {model_size} on {NUM_GPUS}x H100")
-    print("To run in background: nohup modal run train_modal.py ... > training.log 2>&1 &")
-    train.remote(model_size=model_size, extra_args=extra)
+def main(config: str = "nano", extra: str = ""):
+    print(f"Launching Netra training: {config} on {NUM_GPUS}x H100")
+    print("To run in background: nohup modal run scripts/modal_train.py ... > training.log 2>&1 &")
+    train.remote(config=config, extra_args=extra)
     print("Training complete!")

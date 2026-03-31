@@ -1,0 +1,33 @@
+# Netra mini — ~65M params · architecture validation (hours on 1 GPU)
+# Usage: python train.py --config configs/mini.yaml
+
+model:
+  d_model: 384
+  n_layers: 8
+  n_heads: 6
+  d_head: 64
+  d_kv_latent: 256
+  d_q_latent: 384
+  d_rope: 32
+  ffn_hidden: 1024
+  max_seq_len: 1024
+  n_experts: 4
+  n_active_experts: 2
+  has_shared_expert: true
+
+training:
+  batch_size: 32
+  grad_accum_steps: 2
+  max_lr: 4.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 650
+  max_steps: 20000
+
+eval:
+  eval_interval: 500
+  eval_steps: 20
+  generate_interval: 500
+
+logging:
+  log_interval: 10
+  save_interval: 1000
