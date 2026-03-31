@@ -40,6 +40,7 @@ VOLUME_PATH = "/data"
 secrets = [
     modal.Secret.from_name("wandb-secret"),
     modal.Secret.from_name("huggingface-secret"),
+    modal.Secret.from_name("custom-secret"),
 ]
 
 
@@ -52,19 +53,18 @@ secrets = [
 )
 def train_tokenizer(num_samples: int = 500_000):
     """Train BPE tokenizer and persist to Modal volume."""
-    import sys
-    sys.path.insert(0, "/root/netra")
-
-    from datasets import load_dataset
-    from netra import NetraTokenizer
+    import subprocess
+    os.chdir("/root/netra")
 
     save_path = f"{VOLUME_PATH}/tokenizer.json"
-    ds = load_dataset(
-        "HuggingFaceFW/fineweb", "sample-10BT",
-        split="train", streaming=True,
-    )
-    NetraTokenizer.train(ds, vocab_size=32_000, num_samples=num_samples,
-                         save_path=save_path)
+    cmd = [
+        "python", "tools/train_tokenizer.py",
+        "--save_path", save_path,
+        "--num_samples", str(num_samples),
+        "--force",
+    ]
+    print(f"$ {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
     volume.commit()
     print(f"Tokenizer saved → {save_path}")
 
@@ -85,15 +85,11 @@ def tokenize_dataset(
     num_proc: int = 8,
 ):
     """Pre-tokenize the dataset to a flat uint16 binary file on the Modal volume."""
-    import sys
-    import numpy as np
-    sys.path.insert(0, "/root/netra")
+    import subprocess
+    os.chdir("/root/netra")
 
     os.environ["HF_HOME"] = "/tmp/hf_cache"
     os.environ["HF_DATASETS_CACHE"] = "/tmp/hf_cache/datasets"
-
-    from datasets import load_dataset
-    from tokenizers import Tokenizer
 
     tok_path = f"{VOLUME_PATH}/tokenizer.json"
     if not os.path.exists(tok_path):
@@ -101,70 +97,20 @@ def tokenize_dataset(
             "No tokenizer found. Run first:\n"
             "  modal run scripts/modal_train.py::train_tokenizer"
         )
-    tokenizer = Tokenizer.from_file(tok_path)
-    eot_id = tokenizer.token_to_id("<|EOT|>")
-
-    max_tokens = int(max_tokens_b * 1e9) if max_tokens_b > 0 else 0
 
     out_path = f"{VOLUME_PATH}/tokens.bin"
-    limit_str = f" (capped at {max_tokens_b:.0f}B tokens)" if max_tokens else ""
-    print(f"Tokenizing {dataset_name}/{dataset_subset} → {out_path}{limit_str}")
-    print("Downloading dataset (non-streaming) …")
-
-    ds = load_dataset(dataset_name, dataset_subset, split="train")
-    print(f"Downloaded {len(ds):,} documents")
-
-    def tokenize_batch(batch):
-        all_ids = []
-        encoded = tokenizer.encode_batch(batch["text"])
-        for enc in encoded:
-            ids = enc.ids
-            if eot_id is not None:
-                ids.append(eot_id)
-            all_ids.extend(ids)
-        return {"ids": [all_ids], "count": [len(all_ids)]}
-
-    print(f"Tokenizing with {num_proc} workers …")
-    tokenized = ds.map(
-        tokenize_batch,
-        batched=True,
-        batch_size=1000,
-        num_proc=num_proc,
-        remove_columns=ds.column_names,
-    )
-
-    print("Writing tokens.bin …")
-    total_tokens = 0
-    buf = np.empty(2**20, dtype=np.uint16)
-    buf_pos = 0
-    stopped_early = False
-
-    with open(out_path, "wb") as f:
-        for i, row in enumerate(tokenized):
-            for tok in row["ids"]:
-                buf[buf_pos] = tok
-                buf_pos += 1
-                if buf_pos == len(buf):
-                    f.write(buf.tobytes())
-                    total_tokens += buf_pos
-                    buf_pos = 0
-
-            if max_tokens and (total_tokens + buf_pos) >= max_tokens:
-                stopped_early = True
-                break
-
-            if (i + 1) % 2_000_000 == 0:
-                print(f"  {i+1:>12,} rows │ {(total_tokens + buf_pos) / 1e9:.2f}B tokens")
-
-        if buf_pos > 0:
-            f.write(buf[:buf_pos].tobytes())
-            total_tokens += buf_pos
-
-    if stopped_early:
-        print(f"Reached {max_tokens_b:.0f}B token cap — stopping early")
-
-    size_gb = os.path.getsize(out_path) / (1024**3)
-    print(f"Done: {total_tokens:,} tokens ({size_gb:.1f} GB)")
+    cmd = [
+        "python", "tools/tokenize_data.py",
+        "--tokenizer_path", tok_path,
+        "--dataset_name", dataset_name,
+        "--dataset_subset", dataset_subset,
+        "--max_tokens_b", str(max_tokens_b),
+        "--num_proc", str(num_proc),
+        "--out", out_path,
+        "--force",
+    ]
+    print(f"$ {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
     volume.commit()
 
 
@@ -205,11 +151,13 @@ def train(config: str = "nano", extra_args: str = ""):
         "--checkpoint_dir", ckpt_dir,
         "--compile",
     ]
-    if os.path.exists(data_path):
-        train_args.extend(["--data_path", data_path])
-        print(f"Using pre-tokenized data: {data_path}")
-    else:
-        print("No pre-tokenized data found, falling back to streaming")
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(
+            "No pre-tokenized data found. Run first:\n"
+            "  modal run scripts/modal_train.py::tokenize_dataset"
+        )
+    train_args.extend(["--data_path", data_path])
+    print(f"Using pre-tokenized data: {data_path}")
 
     if extra_args:
         train_args.extend(extra_args.split())

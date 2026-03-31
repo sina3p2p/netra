@@ -3,3 +3,4 @@ tokenizers
 datasets
 wandb
 pyyaml
+boto3

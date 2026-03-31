@@ -21,7 +21,8 @@
 #   CONFIG               - YAML config file (default: configs/medium.yaml)
 #   MAX_TOKENS_B         - Billions of tokens to tokenize (default: 22.5)
 #   EXTRA_ARGS           - Extra arguments to pass to train.py
-#   R2_BUCKET            - Cloudflare R2 bucket for checkpoint backup
+#   R2_BUCKET            - Cloudflare R2 bucket (downloads tokens.bin + uploads checkpoints)
+#   R2_DATA_KEY          - Remote key for tokens.bin in R2 (default: tokens.bin)
 #   R2_ENDPOINT_URL      - R2 S3-compatible endpoint
 #   R2_ACCESS_KEY_ID     - R2 access key
 #   R2_SECRET_ACCESS_KEY - R2 secret key
@@ -60,12 +61,27 @@ else
 fi
 echo ""
 
-# ── Step 3: Pre-tokenize data if missing ──────────────────────────────
+# ── Step 3: Get tokens.bin (R2 download or tokenize from scratch) ─────
 if [ -f "tokens.bin" ]; then
     SIZE_GB=$(python3 -c "import os; print(f'{os.path.getsize(\"tokens.bin\") / (1024**3):.1f}')")
     echo "▶ [3/4] tokens.bin found (${SIZE_GB} GB) — skipping"
+elif [ -n "$R2_BUCKET" ]; then
+    echo "▶ [3/4] Downloading tokens.bin from R2..."
+    R2_DATA_KEY="${R2_DATA_KEY:-tokens.bin}"
+    pip install -q boto3 2>/dev/null
+    if python3 tools/r2.py download "$R2_DATA_KEY" --out tokens.bin 2>/dev/null; then
+        SIZE_GB=$(python3 -c "import os; print(f'{os.path.getsize(\"tokens.bin\") / (1024**3):.1f}')")
+        echo "  ✓ Downloaded tokens.bin from R2 (${SIZE_GB} GB)"
+    else
+        echo "  ⚠ R2 download failed — falling back to tokenization"
+        echo "  This will take a while (1-3 hours on CPU)..."
+        python3 tools/tokenize_data.py \
+            --max_tokens_b "$MAX_TOKENS_B" \
+            --out tokens.bin
+        echo "  ✓ tokens.bin created"
+    fi
 else
-    echo "▶ [3/4] Downloading & tokenizing ${MAX_TOKENS_B}B tokens from FineWeb..."
+    echo "▶ [3/4] Tokenizing ${MAX_TOKENS_B}B tokens from FineWeb..."
     echo "  This will take a while (1-3 hours on CPU)..."
     python3 tools/tokenize_data.py \
         --max_tokens_b "$MAX_TOKENS_B" \

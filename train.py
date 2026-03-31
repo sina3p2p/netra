@@ -133,8 +133,8 @@ def parse_args():
     p.add_argument("--compile", action="store_true")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--wandb_run_name", type=str, default=None)
-    p.add_argument("--r2_bucket", type=str, default=None,
-                   help="Cloudflare R2 bucket for checkpoint backup")
+    p.add_argument("--r2_bucket", type=str, default=os.environ.get("R2_BUCKET"),
+                   help="Cloudflare R2 bucket (default: $R2_BUCKET env var)")
     p.add_argument("--keep_local_ckpt", action="store_true", default=False,
                    help="Keep local checkpoint after R2 upload (default: delete)")
 
@@ -355,14 +355,8 @@ def save_checkpoint(model, optimizer, step, model_config, path,
 
     if r2_bucket:
         try:
-            import boto3
-            s3 = boto3.client("s3",
-                endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
-                aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
-                aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"),
-            )
-            key = f"checkpoints/{Path(path).name}"
-            s3.upload_file(str(path), r2_bucket, key)
+            from tools.r2 import upload
+            key = upload(str(path), r2_bucket, key=f"checkpoints/{Path(path).name}")
             print(f"  ↳ uploaded to r2://{r2_bucket}/{key}")
             if not keep_local:
                 Path(path).unlink()
