@@ -62,12 +62,12 @@ class ModelConfig:
 
     @classmethod
     def small(cls, **kwargs):
-        """~260M params · 12 layers (9M+3G) · hyperparameter tuning (days on 1 GPU)."""
+        """~280M params · 12 layers (9M+3G) · hyperparameter tuning (days on 1 GPU)."""
         defaults = dict(
             vocab_size=32_000,
-            d_model=576, n_layers=12, n_heads=8, d_head=64,
-            d_kv_latent=384, d_q_latent=576, d_rope=32,
-            ffn_hidden=1536, max_seq_len=2048,
+            d_model=640, n_layers=12, n_heads=10, d_head=64,
+            d_kv_latent=448, d_q_latent=640, d_rope=32,
+            ffn_hidden=1792, max_seq_len=2048,
             n_experts=6, n_active_experts=2,
             has_shared_expert=True,
         )

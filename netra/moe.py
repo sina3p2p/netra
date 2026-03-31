@@ -69,11 +69,13 @@ class MoELayer(nn.Module):
         sorted_token_ids = token_ids[sort_order]
         sorted_weights = flat_weights[sort_order]
 
-        splits = torch.bincount(sorted_expert_ids, minlength=self.n_experts).cpu().tolist()
+        # Single GPU→CPU sync per layer (unavoidable with Python expert loop)
+        tokens_per_expert = torch.bincount(sorted_expert_ids, minlength=self.n_experts)
+        split_sizes = tokens_per_expert.tolist()
 
         out = torch.zeros_like(flat_x)
         start = 0
-        for e, count in enumerate(splits):
+        for e, count in enumerate(split_sizes):
             if count == 0:
                 continue
             end = start + count
@@ -88,16 +90,11 @@ class MoELayer(nn.Module):
         out = out.view(B, S, D)
 
         with torch.no_grad():
-            tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
-            for i in range(self.n_active):
-                tokens_per_expert.scatter_add_(
-                    0, top_indices[:, i], torch.ones(N, device=x.device)
-                )
-            self._tokens_per_expert = tokens_per_expert
+            self._tokens_per_expert = tokens_per_expert.float()
 
             if self.training:
                 target_load = N * self.n_active / self.n_experts
-                load_error = tokens_per_expert - target_load
+                load_error = self._tokens_per_expert - target_load
                 self.expert_bias -= self.bias_update_speed * load_error.sign()
 
         return out

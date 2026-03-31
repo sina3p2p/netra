@@ -2,13 +2,22 @@
 """
 Netra pretraining script with wandb monitoring.
 
+Supports single-GPU and multi-GPU (DDP) training.
+
 Usage:
-    python train.py --model_size nano  --tokenizer_path tokenizer.json
-    python train.py --model_size mini --max_steps 8000
-    python train.py --model_size full  --batch_size 4 --grad_accum_steps 16
+    # Single GPU
+    python train.py --model_size nano --tokenizer_path tokenizer.json
+
+    # Multi-GPU (4 GPUs on one machine)
+    torchrun --nproc_per_node=4 train.py --model_size small
+
+    # Multi-node (2 nodes × 4 GPUs)
+    torchrun --nnodes=2 --nproc_per_node=4 --rdzv_backend=c10d \\
+        --rdzv_endpoint=HOST:PORT train.py --model_size full
 """
 
 import argparse
+import inspect
 import math
 import os
 import time
@@ -17,14 +26,16 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 import wandb
 from datasets import load_dataset
 
 from netra import ModelConfig, Netra, NetraTokenizer
-from netra.data import StreamingTokenDataset
+from netra.data import MemmapTokenDataset, StreamingTokenDataset
 
 # ── Training presets per model size ───────────────────────────────────
 
@@ -37,9 +48,9 @@ TRAIN_PRESETS = {
         batch_size=32, grad_accum_steps=2,  # eff batch = 64 × 1024 = 64K tok
         max_lr=4e-4, warmup_steps=650, max_steps=20_000,
     ),
-    "small": dict(                          # ~5.2B tokens (20× ~260M params)
+    "small": dict(                          # ~6.7B tokens (20× ~334M params)
         batch_size=16, grad_accum_steps=4,  # eff batch = 64 × 2048 = 128K tok
-        max_lr=3e-4, warmup_steps=1_400, max_steps=40_000,
+        max_lr=3e-4, warmup_steps=1_700, max_steps=51_000,
     ),
     "full": dict(                           # ~15B tokens (20× ~750M params)
         batch_size=8, grad_accum_steps=8,   # eff batch = 64 × 2048 = 128K tok
@@ -47,17 +58,28 @@ TRAIN_PRESETS = {
     ),
 }
 
+# ── DDP helpers ───────────────────────────────────────────────────────
+
+
+def setup_ddp():
+    """Detect torchrun env vars and init process group. Returns (rank, local_rank, world_size)."""
+    if "RANK" not in os.environ:
+        return 0, 0, 1
+
+    dist.init_process_group("nccl")
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    return rank, local_rank, world_size
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
 # ── Helpers ───────────────────────────────────────────────────────────
-
-
-def resolve_device(name: str) -> torch.device:
-    if name != "auto":
-        return torch.device(name)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def resolve_dtype(name: str) -> torch.dtype:
@@ -79,9 +101,20 @@ def count_parameters(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def collect_moe_metrics(model: Netra) -> dict:
+def get_raw_model(model):
+    """Unwrap DDP / torch.compile to get the underlying Netra module."""
+    m = model
+    if isinstance(m, DDP):
+        m = m.module
+    if hasattr(m, "_orig_mod"):
+        m = m._orig_mod
+    return m
+
+
+def collect_moe_metrics(model) -> dict:
+    raw = get_raw_model(model)
     metrics = {}
-    for i, layer in enumerate(model.layers):
+    for i, layer in enumerate(raw.layers):
         moe = layer.moe
         if not hasattr(moe, "_tokens_per_expert"):
             continue
@@ -103,37 +136,40 @@ def collect_moe_metrics(model: Netra) -> dict:
 @torch.no_grad()
 def generate(model, tokenizer, prompt: str, max_tokens: int,
              temperature: float = 0.8, device: torch.device = torch.device("cpu")):
-    model.eval()
+    raw = get_raw_model(model)
+    raw.eval()
     ids = torch.tensor(tokenizer.encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
     for _ in range(max_tokens):
-        inp = ids[:, -model.config.max_seq_len :]
-        logits, _ = model(inp)
+        inp = ids[:, -raw.config.max_seq_len :]
+        logits, _ = raw(inp)
         next_logits = logits[:, -1, :] / max(temperature, 1e-8)
         probs = F.softmax(next_logits, dim=-1)
         next_id = torch.multinomial(probs, num_samples=1)
         ids = torch.cat([ids, next_id], dim=1)
         if next_id.item() == tokenizer.eot_id:
             break
-    model.train()
+    raw.train()
     return tokenizer.decode(ids[0].tolist())
 
 
 @torch.no_grad()
 def evaluate(model, eval_batches, device, ctx):
-    model.eval()
+    raw = get_raw_model(model)
+    raw.eval()
     total_loss = 0.0
     for x, y in eval_batches:
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         with ctx:
-            _, loss = model(x, targets=y)
+            _, loss = raw(x, targets=y)
         total_loss += loss.item()
-    model.train()
+    raw.train()
     return total_loss / max(len(eval_batches), 1)
 
 
 def save_checkpoint(model, optimizer, step, model_config, path):
+    raw = get_raw_model(model)
     torch.save({
-        "model": model.state_dict(),
+        "model": raw.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
         "model_config": asdict(model_config),
@@ -152,6 +188,8 @@ def parse_args():
 
     p.add_argument("--dataset_name", type=str, default="HuggingFaceFW/fineweb")
     p.add_argument("--dataset_subset", type=str, default="sample-10BT")
+    p.add_argument("--data_path", type=str, default=None,
+                    help="Path to pre-tokenized tokens.bin (skips streaming if set)")
 
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--grad_accum_steps", type=int, default=None)
@@ -179,6 +217,7 @@ def parse_args():
     p.add_argument("--generate_interval", type=int, default=500)
     p.add_argument("--generate_max_tokens", type=int, default=100)
 
+    p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--resume_from", type=str, default=None)
 
@@ -197,8 +236,28 @@ def parse_args():
 
 def main():
     args = parse_args()
+    rank, local_rank, world_size = setup_ddp()
+    is_main = rank == 0
+    ddp = world_size > 1
 
-    device = resolve_device(args.device)
+    # Scale steps down by world_size to keep the same total token budget
+    if world_size > 1:
+        args.max_steps = max(args.max_steps // world_size, 1)
+        args.warmup_steps = max(args.warmup_steps // world_size, 1)
+        if is_main:
+            print(f"DDP: {world_size} GPUs → scaled max_steps to {args.max_steps}, "
+                  f"warmup to {args.warmup_steps}")
+
+    if ddp:
+        device = torch.device(f"cuda:{local_rank}")
+    elif args.device != "auto":
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     dtype = resolve_dtype(args.dtype)
     min_lr = args.max_lr * args.min_lr_ratio
 
@@ -218,113 +277,165 @@ def main():
             "Train one first with NetraTokenizer.train() (see notebooks/main.ipynb)."
         )
     tokenizer = NetraTokenizer.from_file(tok_path)
-    print(f"Tokenizer loaded — vocab size: {tokenizer.vocab_size:,}")
+    if is_main:
+        print(f"Tokenizer loaded — vocab size: {tokenizer.vocab_size:,}")
 
     # ── Model ─────────────────────────────────────────────────────────
 
     model_config = getattr(ModelConfig, args.model_size)(vocab_size=tokenizer.vocab_size)
     model = Netra(model_config).to(device)
     n_params = count_parameters(model)
-    print(f"Model: {args.model_size} | {n_params:,} params | device: {device}")
+    if is_main:
+        print(f"Model: {args.model_size} | {n_params:,} params | "
+              f"device: {device} | world_size: {world_size}")
 
-    if args.compile and hasattr(torch, "compile"):
-        print("Compiling model with torch.compile ...")
-        model = torch.compile(model)
-
-    # ── Optimizer ─────────────────────────────────────────────────────
-
-    decay, no_decay = [], []
-    for name, param in model.named_parameters():
-        if param.dim() < 2 or "norm" in name:
-            no_decay.append(param)
-        else:
-            decay.append(param)
-
-    optimizer = torch.optim.AdamW([
-        {"params": decay, "weight_decay": args.weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ], lr=args.max_lr, betas=(args.beta1, args.beta2))
-
-    # ── Data ──────────────────────────────────────────────────────────
-
-    print("Initialising data streams …")
-    train_ds = load_dataset(
-        args.dataset_name, args.dataset_subset,
-        split="train", streaming=True,
-    ).shuffle(seed=0, buffer_size=10_000)
-
-    eval_ds = load_dataset(
-        args.dataset_name, args.dataset_subset,
-        split="train", streaming=True,
-    ).shuffle(seed=42, buffer_size=10_000)
-
-    train_dataset = StreamingTokenDataset(tokenizer, train_ds, seq_len=model_config.max_seq_len)
-    eval_dataset = StreamingTokenDataset(tokenizer, eval_ds, seq_len=model_config.max_seq_len)
-
-    use_pinmem = device.type == "cuda"
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, pin_memory=use_pinmem,
-    )
-    eval_loader = DataLoader(
-        eval_dataset, batch_size=args.batch_size, pin_memory=use_pinmem,
-    )
-
-    # Buffer eval batches so we can re-use them without re-streaming
-    print("Buffering eval data …")
-    eval_batches = []
-    for i, batch in enumerate(eval_loader):
-        if i >= args.eval_steps:
-            break
-        eval_batches.append(batch)
-    print(f"Buffered {len(eval_batches)} eval batches")
-
-    train_iter = iter(train_loader)
-
-    # ── Resume ────────────────────────────────────────────────────────
+    # ── Resume (before DDP wrap) ────────────────────────────────────────
 
     start_step = 0
     if args.resume_from:
         ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"]
-        print(f"Resumed from checkpoint at step {start_step}")
+        if is_main:
+            print(f"Resumed model from step {start_step}")
 
-    # ── Wandb ─────────────────────────────────────────────────────────
+    # ── Compile then DDP wrap ─────────────────────────────────────────
 
-    run_name = args.wandb_run_name or f"netra-{args.model_size}"
-    wandb.init(
-        project=args.wandb_project,
-        name=run_name,
-        mode="disabled" if args.no_wandb else "online",
-        config={
-            "model": asdict(model_config),
-            "n_params": n_params,
-            "batch_size": args.batch_size,
-            "grad_accum_steps": args.grad_accum_steps,
-            "effective_batch_tokens": args.batch_size * args.grad_accum_steps * model_config.max_seq_len,
-            "max_lr": args.max_lr,
-            "min_lr": min_lr,
-            "warmup_steps": args.warmup_steps,
-            "max_steps": args.max_steps,
-            "weight_decay": args.weight_decay,
-            "grad_clip": args.grad_clip,
-            "dtype": args.dtype,
-            "device": str(device),
-        },
+    if args.compile and hasattr(torch, "compile"):
+        if is_main:
+            print("Compiling model with torch.compile ...")
+        model = torch.compile(model)
+
+    if ddp:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
+    # ── Optimizer ─────────────────────────────────────────────────────
+
+    raw_model = get_raw_model(model)
+    decay, no_decay = [], []
+    for name, param in raw_model.named_parameters():
+        if param.dim() < 2 or "norm" in name:
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    use_fused = device.type == "cuda" and "fused" in inspect.signature(torch.optim.AdamW).parameters
+    optimizer = torch.optim.AdamW([
+        {"params": decay, "weight_decay": args.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ], lr=args.max_lr, betas=(args.beta1, args.beta2), fused=use_fused)
+
+    if args.resume_from and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+        if is_main:
+            print(f"Resumed optimizer from step {start_step}")
+
+    # ── Data ──────────────────────────────────────────────────────────
+
+    use_pinmem = device.type == "cuda"
+    persist = args.num_workers > 0
+
+    if args.data_path and os.path.exists(args.data_path):
+        if is_main:
+            print(f"Using pre-tokenized data: {args.data_path}")
+        import numpy as np
+        total_tokens = os.path.getsize(args.data_path) // 2  # uint16
+        eval_tokens = args.eval_steps * args.batch_size * (model_config.max_seq_len + 1)
+        train_end = total_tokens - eval_tokens
+
+        train_dataset = MemmapTokenDataset(
+            args.data_path, seq_len=model_config.max_seq_len,
+            rank=rank, world_size=world_size,
+            start=0, end=train_end, shuffle=True, seed=0,
+        )
+        eval_dataset = MemmapTokenDataset(
+            args.data_path, seq_len=model_config.max_seq_len,
+            start=train_end, end=total_tokens,
+        )
+        if is_main:
+            print(f"  train: {train_end:,} tokens │ eval: {eval_tokens:,} tokens")
+    else:
+        if is_main:
+            print("Initialising data streams …")
+
+        train_ds = load_dataset(
+            args.dataset_name, args.dataset_subset,
+            split="train", streaming=True,
+        ).shuffle(seed=0, buffer_size=10_000)
+
+        eval_ds = load_dataset(
+            args.dataset_name, args.dataset_subset,
+            split="train", streaming=True,
+        ).shuffle(seed=42, buffer_size=10_000)
+
+        train_dataset = StreamingTokenDataset(
+            tokenizer, train_ds, seq_len=model_config.max_seq_len,
+            rank=rank, world_size=world_size,
+        )
+        eval_dataset = StreamingTokenDataset(
+            tokenizer, eval_ds, seq_len=model_config.max_seq_len,
+        )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size,
+        num_workers=args.num_workers, pin_memory=use_pinmem,
+        persistent_workers=persist,
     )
+    eval_loader = DataLoader(
+        eval_dataset, batch_size=args.batch_size,
+        num_workers=0, pin_memory=use_pinmem,
+    )
+
+    eval_batches = []
+    if is_main:
+        print("Buffering eval data …")
+        for i, batch in enumerate(eval_loader):
+            if i >= args.eval_steps:
+                break
+            eval_batches.append(batch)
+        print(f"Buffered {len(eval_batches)} eval batches")
+
+    train_iter = iter(train_loader)
+
+    # ── Wandb (rank 0 only) ───────────────────────────────────────────
+
+    eff_batch_tokens = args.batch_size * args.grad_accum_steps * world_size * model_config.max_seq_len
+
+    if is_main:
+        run_name = args.wandb_run_name or f"netra-{args.model_size}"
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            mode="disabled" if args.no_wandb else "online",
+            config={
+                "model": asdict(model_config),
+                "n_params": n_params,
+                "batch_size_per_gpu": args.batch_size,
+                "grad_accum_steps": args.grad_accum_steps,
+                "world_size": world_size,
+                "effective_batch_tokens": eff_batch_tokens,
+                "max_lr": args.max_lr,
+                "min_lr": min_lr,
+                "warmup_steps": args.warmup_steps,
+                "max_steps": args.max_steps,
+                "weight_decay": args.weight_decay,
+                "grad_clip": args.grad_clip,
+                "dtype": args.dtype,
+                "device": str(device),
+            },
+        )
 
     # ── Training loop ─────────────────────────────────────────────────
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     model.train()
 
-    eff_batch_tokens = args.batch_size * args.grad_accum_steps * model_config.max_seq_len
-    print(f"\nEffective batch: {args.batch_size}×{args.grad_accum_steps} "
-          f"= {args.batch_size * args.grad_accum_steps} sequences "
-          f"({eff_batch_tokens:,} tokens)")
-    print(f"Training for {args.max_steps:,} steps "
-          f"(~{args.max_steps * eff_batch_tokens / 1e6:.0f}M tokens)\n")
+    if is_main:
+        print(f"\nEffective batch: {args.batch_size}×{args.grad_accum_steps}×{world_size} "
+              f"= {args.batch_size * args.grad_accum_steps * world_size} sequences "
+              f"({eff_batch_tokens:,} tokens)")
+        print(f"Training for {args.max_steps:,} steps "
+              f"(~{args.max_steps * eff_batch_tokens / 1e6:.0f}M tokens)\n")
 
     loss_accum = 0.0
     total_tokens = start_step * eff_batch_tokens
@@ -340,19 +451,25 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
 
-        for _micro in range(args.grad_accum_steps):
+        for micro_step in range(args.grad_accum_steps):
             try:
                 x, y = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
                 x, y = next(train_iter)
 
-            x, y = x.to(device), y.to(device)
-            with ctx:
-                _, loss = model(x, targets=y)
-                loss = loss / args.grad_accum_steps
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-            scaler.scale(loss).backward()
+            # Skip all-reduce on non-final micro-steps for efficiency
+            is_last_micro = micro_step == args.grad_accum_steps - 1
+            sync_ctx = nullcontext() if (not ddp or is_last_micro) else model.no_sync()
+
+            with sync_ctx:
+                with ctx:
+                    _, loss = model(x, targets=y)
+                    loss = loss / args.grad_accum_steps
+
+                scaler.scale(loss).backward()
             step_loss += loss.item()
 
         scaler.unscale_(optimizer)
@@ -364,9 +481,9 @@ def main():
         total_tokens += eff_batch_tokens
         step_ms = (time.time() - t_step) * 1000
 
-        # ── Periodic logging ──────────────────────────────────────────
+        # ── Periodic logging (rank 0) ─────────────────────────────────
 
-        if (step + 1) % args.log_interval == 0:
+        if is_main and (step + 1) % args.log_interval == 0:
             avg_loss = loss_accum / args.log_interval
             elapsed = time.time() - t_start
             tok_per_sec = total_tokens / elapsed if elapsed > 0 else 0
@@ -389,16 +506,16 @@ def main():
 
             loss_accum = 0.0
 
-        # ── Evaluation ────────────────────────────────────────────────
+        # ── Evaluation (rank 0) ───────────────────────────────────────
 
-        if eval_batches and (step + 1) % args.eval_interval == 0:
+        if is_main and eval_batches and (step + 1) % args.eval_interval == 0:
             val_loss = evaluate(model, eval_batches, device, ctx)
             wandb.log({"eval/loss": val_loss}, step=step + 1)
             print(f"  ↳ eval loss: {val_loss:.4f}")
 
-        # ── Text generation samples ──────────────────────────────────
+        # ── Text generation (rank 0) ──────────────────────────────────
 
-        if (step + 1) % args.generate_interval == 0:
+        if is_main and (step + 1) % args.generate_interval == 0:
             prompts = ["The meaning of life is", "Once upon a time", "In 2025,"]
             table = wandb.Table(columns=["step", "prompt", "generation"])
             for p in prompts:
@@ -407,19 +524,22 @@ def main():
                 print(f"  ↳ [{p}] → {text[:120]}")
             wandb.log({"samples": table}, step=step + 1)
 
-        # ── Checkpoint ────────────────────────────────────────────────
+        # ── Checkpoint (rank 0) ───────────────────────────────────────
 
-        if (step + 1) % args.save_interval == 0:
+        if is_main and (step + 1) % args.save_interval == 0:
             ckpt_path = Path(args.checkpoint_dir) / f"step_{step+1}.pt"
             save_checkpoint(model, optimizer, step + 1, model_config, ckpt_path)
             print(f"  ↳ checkpoint saved → {ckpt_path}")
 
     # ── Final save ────────────────────────────────────────────────────
 
-    final_path = Path(args.checkpoint_dir) / "final.pt"
-    save_checkpoint(model, optimizer, args.max_steps, model_config, final_path)
-    print(f"\nTraining complete. Final checkpoint → {final_path}")
-    wandb.finish()
+    if is_main:
+        final_path = Path(args.checkpoint_dir) / "final.pt"
+        save_checkpoint(model, optimizer, args.max_steps, model_config, final_path)
+        print(f"\nTraining complete. Final checkpoint → {final_path}")
+        wandb.finish()
+
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
