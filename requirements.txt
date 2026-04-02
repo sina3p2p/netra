@@ -1,6 +1,7 @@
 torch
 tokenizers
 datasets
+huggingface_hub
 wandb
 pyyaml
 boto3
