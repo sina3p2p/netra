@@ -53,11 +53,14 @@ class StreamingTokenDataset(IterableDataset):
 
 class MemmapTokenDataset(IterableDataset):
     """
-    Reads pre-tokenized data from a flat memory-mapped uint16 file.
+    Reads pre-tokenized data from a flat memory-mapped binary file.
 
     The file is a contiguous array of token IDs produced by a one-time
-    tokenization pass. Each (rank, worker) pair gets a disjoint contiguous
-    shard of the file. Yields (input_ids, targets) pairs of shape (seq_len,).
+    tokenization pass. Dtype is auto-detected from file size and vocab_size:
+    uint16 for vocab <= 65536, uint32 otherwise.
+
+    Each (rank, worker) pair gets a disjoint contiguous shard of the file.
+    Yields (input_ids, targets) pairs of shape (seq_len,).
 
     Supports an optional (start, end) token range to carve out train/eval
     splits from the same file.
@@ -66,7 +69,8 @@ class MemmapTokenDataset(IterableDataset):
     def __init__(self, path: str, seq_len: int,
                  rank: int = 0, world_size: int = 1,
                  start: int = 0, end: int | None = None,
-                 shuffle: bool = False, seed: int = 0):
+                 shuffle: bool = False, seed: int = 0,
+                 vocab_size: int = 32000):
         self.path = path
         self.seq_len = seq_len
         self.rank = rank
@@ -75,9 +79,10 @@ class MemmapTokenDataset(IterableDataset):
         self.end = end
         self.shuffle = shuffle
         self.seed = seed
+        self.dtype = np.uint32 if vocab_size > 65536 else np.uint16
 
     def __iter__(self):
-        tokens = np.memmap(self.path, dtype=np.uint16, mode="r")
+        tokens = np.memmap(self.path, dtype=self.dtype, mode="r")
         total_len = len(tokens) if self.end is None else self.end
         region_len = total_len - self.start
 

@@ -9,13 +9,16 @@ Usage:
     modal run scripts/modal_train.py::tokenize_dataset
 
     # 3. Train the model:
-    modal run scripts/modal_train.py --config medium
+    modal run scripts/modal_script.py -- --config medium
 
     # 4. Multi-GPU training:
-    NETRA_GPUS=4 modal run scripts/modal_train.py --config medium
+    NETRA_GPUS=4 modal run scripts/modal_script.py -- --config medium
 
-    # 5. Run in background:
-    modal run --detach scripts/modal_train.py --config medium
+    # 5. Pass extra train.py args:
+    modal run scripts/modal_script.py -- --config medium --lr 3e-4
+
+    # 6. Run in background:
+    modal run --detach scripts/modal_script.py -- --config medium
 """
 
 import os
@@ -24,6 +27,7 @@ import modal
 app = modal.App("netra")
 
 NUM_GPUS = int(os.environ.get("NETRA_GPUS", "1"))
+GPU_TYPE = "H100"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -37,12 +41,7 @@ image = (
 volume = modal.Volume.from_name("netra-data", create_if_missing=True)
 VOLUME_PATH = "/data"
 
-secrets = [
-    modal.Secret.from_name("wandb-secret"),
-    modal.Secret.from_name("huggingface-secret"),
-    modal.Secret.from_name("custom-secret"),
-]
-
+secrets = [modal.Secret.from_dotenv()]
 
 @app.function(
     image=image,
@@ -133,53 +132,63 @@ def tokenize_dataset(
 
 @app.function(
     image=image,
-    gpu=f"H100:{NUM_GPUS}" if NUM_GPUS > 1 else "H100",
+    gpu=f"{GPU_TYPE}:{NUM_GPUS}" if NUM_GPUS > 1 else GPU_TYPE,
     volumes={VOLUME_PATH: volume},
     secrets=secrets,
     timeout=24 * 3600,
 )
-def train(config: str = "nano", extra_args: str = ""):
-    """Run Netra pretraining on cloud GPU(s). Uses torchrun for multi-GPU."""
-    import subprocess, shutil, torch
+def train(*arglist):
+    """Run Netra pretraining on cloud GPU(s). Uses torchrun for multi-GPU.
+
+    Accepts any train.py CLI args directly, e.g.:
+        modal run scripts/modal_script.py::train -- --config medium
+        modal run scripts/modal_script.py::train -- --config medium --lr 3e-4
+    """
+    import argparse, subprocess, torch
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="nano")
+    args, extra = parser.parse_known_args(arglist)
+
+    config_name = args.config
+    config_path = f"configs/{config_name}.yaml"
+    num_gpus = torch.cuda.device_count()
+    tok_path = f"{VOLUME_PATH}/tokenizer.json"
+    data_path = f"{VOLUME_PATH}/tokens.bin"
+    ckpt_dir = f"{VOLUME_PATH}/checkpoints/{config_name}"
 
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "0"
     os.chdir("/root/netra")
-
-    tok_vol = f"{VOLUME_PATH}/tokenizer.json"
-    tok_local = "/root/netra/tokenizer.json"
-    if os.path.exists(tok_vol):
-        shutil.copy(tok_vol, tok_local)
-        print("Loaded tokenizer from volume")
-    else:
-        raise FileNotFoundError(
-            "No tokenizer found. Run first:\n"
-            "  modal run scripts/modal_train.py::train_tokenizer"
-        )
-
-    ckpt_dir = f"{VOLUME_PATH}/checkpoints/{config}"
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    data_path = f"{VOLUME_PATH}/tokens.bin"
-    config_path = f"configs/{config}.yaml"
+    print(f"Launching Netra training: {config_name} on {num_gpus}x {GPU_TYPE}")
 
+    # Resolve tokenizer and data: volume → R2 → error
+    need_tok = not os.path.exists(tok_path)
+    need_data = not os.path.exists(data_path)
+
+    if need_tok or need_data:
+        from tools.r2 import is_configured, download
+        if not is_configured():
+            raise RuntimeError("R2 is required to download missing files. Set R2 env vars.")
+        bucket = os.environ["R2_BUCKET"]
+        if need_tok:
+            print(f"tokenizer.json not on volume — downloading from R2 ({bucket}) …")
+            download("tokenizer.json", bucket, local_path=tok_path)
+        if need_data:
+            print(f"tokens.bin not on volume — downloading from R2 ({bucket}) …")
+            download("tokens.bin", bucket, local_path=data_path)
+        volume.commit()
+
+    # Build command
     train_args = [
         "--config", config_path,
-        "--tokenizer_path", tok_local,
+        "--tokenizer_path", tok_path,
         "--checkpoint_dir", ckpt_dir,
         "--compile",
-    ]
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(
-            "No pre-tokenized data found. Run first:\n"
-            "  modal run scripts/modal_train.py::tokenize_dataset"
-        )
-    train_args.extend(["--data_path", data_path])
-    print(f"Using pre-tokenized data: {data_path}")
+        "--data_path", data_path,
+    ] + list(extra)
 
-    if extra_args:
-        train_args.extend(extra_args.split())
-
-    num_gpus = torch.cuda.device_count()
     if num_gpus > 1:
         cmd = [
             "torchrun",
@@ -190,7 +199,6 @@ def train(config: str = "nano", extra_args: str = ""):
     else:
         cmd = ["python", "train.py"] + train_args
 
-    print(f"GPUs available: {num_gpus}")
     print(f"$ {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
     volume.commit()
@@ -198,8 +206,6 @@ def train(config: str = "nano", extra_args: str = ""):
 
 
 @app.local_entrypoint()
-def main(config: str = "nano", extra: str = ""):
-    print(f"Launching Netra training: {config} on {NUM_GPUS}x H100")
-    print("To run in background: nohup modal run scripts/modal_train.py ... > training.log 2>&1 &")
-    train.remote(config=config, extra_args=extra)
+def main(*arglist):
+    train.remote(*arglist)
     print("Training complete!")

@@ -5,3 +5,4 @@ huggingface_hub
 wandb
 pyyaml
 boto3
+python-dotenv

@@ -11,9 +11,9 @@ Usage:
     # Multi-GPU (4 GPUs on one machine)
     torchrun --nproc_per_node=4 train.py --config configs/small.yaml --data_path tokens.bin
 
-    # Multi-GPU with R2 backup
-    torchrun --nproc_per_node=8 train.py --config configs/medium.yaml \\
-        --data_path tokens.bin --r2_bucket netra-checkpoints
+    # Multi-GPU with R2 backup (set R2_BUCKET env var)
+    R2_BUCKET=netra-checkpoints torchrun --nproc_per_node=8 train.py \\
+        --config configs/medium.yaml --data_path tokens.bin
 """
 
 import argparse
@@ -21,6 +21,7 @@ import inspect
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
@@ -133,12 +134,11 @@ def parse_args():
     p.add_argument("--compile", action="store_true")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--wandb_run_name", type=str, default=None)
-    p.add_argument("--r2_bucket", type=str, default=os.environ.get("R2_BUCKET"),
-                   help="Cloudflare R2 bucket (default: $R2_BUCKET env var)")
     p.add_argument("--keep_local_ckpt", action="store_true", default=False,
                    help="Keep local checkpoint after R2 upload (default: delete)")
 
     args = p.parse_args()
+    args.r2_bucket = os.environ.get("R2_BUCKET")
 
     cfg = load_config(args.config)
     args._model_cfg = cfg.get("model", {})
@@ -154,7 +154,7 @@ def parse_args():
     e = cfg.get("eval", {})
     args.eval_interval = e.get("eval_interval", 500)
     args.eval_steps = e.get("eval_steps", 20)
-    args.generate_interval = e.get("generate_interval", 500)
+    args.generate_interval = e.get("generate_interval", 1000)
 
     log = cfg.get("logging", {})
     args.log_interval = log.get("log_interval", 10)
@@ -202,9 +202,8 @@ def build_model(args, tokenizer, device, rank, local_rank, world_size):
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
 
-    ddp = world_size > 1
-    if ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     return model, model_config, start_step, ckpt
 
@@ -233,7 +232,9 @@ def build_dataloaders(args, model_config, rank, world_size, device):
         )
 
     use_pinmem = device.type == "cuda"
-    total_tokens = os.path.getsize(args.data_path) // 2
+    vocab_size = model_config.vocab_size
+    bytes_per_token = 4 if vocab_size > 65536 else 2
+    total_tokens = os.path.getsize(args.data_path) // bytes_per_token
     eval_tokens = args.eval_steps * args.batch_size * (model_config.max_seq_len + 1)
     train_end = total_tokens - eval_tokens
 
@@ -241,10 +242,12 @@ def build_dataloaders(args, model_config, rank, world_size, device):
         args.data_path, seq_len=model_config.max_seq_len,
         rank=rank, world_size=world_size,
         start=0, end=train_end, shuffle=True, seed=0,
+        vocab_size=vocab_size,
     )
     eval_dataset = MemmapTokenDataset(
         args.data_path, seq_len=model_config.max_seq_len,
         start=train_end, end=total_tokens,
+        vocab_size=vocab_size,
     )
 
     train_loader = DataLoader(
@@ -306,7 +309,7 @@ def train_step(model, optimizer, scaler, train_iter, train_loader,
     return step_loss, grad_norm, train_iter
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(model, eval_batches, device, ctx):
     raw = get_raw_model(model)
     raw.eval()
@@ -320,7 +323,7 @@ def evaluate(model, eval_batches, device, ctx):
     return total_loss / max(len(eval_batches), 1)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generate(model, tokenizer, prompt, max_tokens,
              temperature=0.8, device=torch.device("cpu")):
     raw = get_raw_model(model)
@@ -343,8 +346,20 @@ def generate(model, tokenizer, prompt, max_tokens,
     return tokenizer.decode(ids[0].tolist())
 
 
+def _upload_checkpoint(local_path: str, r2_bucket: str, keep_local: bool):
+    try:
+        from tools.r2 import upload
+        key = upload(local_path, r2_bucket, key=f"checkpoints/{Path(local_path).name}")
+        print(f"  ↳ uploaded to r2://{r2_bucket}/{key}")
+        if not keep_local:
+            Path(local_path).unlink()
+            print(f"  ↳ deleted local {local_path}")
+    except Exception as e:
+        print(f"  ⚠ R2 upload failed: {e} (local copy kept)")
+
+
 def save_checkpoint(model, optimizer, step, model_config, path,
-                    r2_bucket=None, keep_local=True):
+                    r2_bucket=None, keep_local=True, upload_executor=None):
     raw = get_raw_model(model)
     torch.save({
         "model": raw.state_dict(),
@@ -354,15 +369,10 @@ def save_checkpoint(model, optimizer, step, model_config, path,
     }, path)
 
     if r2_bucket:
-        try:
-            from tools.r2 import upload
-            key = upload(str(path), r2_bucket, key=f"checkpoints/{Path(path).name}")
-            print(f"  ↳ uploaded to r2://{r2_bucket}/{key}")
-            if not keep_local:
-                Path(path).unlink()
-                print(f"  ↳ deleted local {path}")
-        except Exception as e:
-            print(f"  ⚠ R2 upload failed: {e} (local copy kept)")
+        if upload_executor is not None:
+            upload_executor.submit(_upload_checkpoint, str(path), r2_bucket, keep_local)
+        else:
+            _upload_checkpoint(str(path), r2_bucket, keep_local)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -456,6 +466,7 @@ def main():
     # ── Training loop ─────────────────────────────────────────────────
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    upload_executor = ThreadPoolExecutor(max_workers=1) if args.r2_bucket else None
     model.train()
     train_iter = iter(train_loader)
 
@@ -499,7 +510,8 @@ def main():
                 "train/tok_per_sec": tok_per_sec,
                 "train/step_ms": step_ms,
             }
-            log_dict.update(collect_moe_metrics(model))
+            if (step + 1) % 250 == 0:
+                log_dict.update(collect_moe_metrics(model))
             wandb.log(log_dict, step=step + 1)
 
             print(f"step {step+1:>6d}/{args.max_steps} │ "
@@ -526,15 +538,23 @@ def main():
             ckpt_path = Path(args.checkpoint_dir) / f"step_{step+1}.pt"
             save_checkpoint(model, optimizer, step + 1, model_config, ckpt_path,
                             r2_bucket=args.r2_bucket,
-                            keep_local=args.keep_local_ckpt)
+                            keep_local=args.keep_local_ckpt,
+                            upload_executor=upload_executor)
             print(f"  ↳ checkpoint saved → {ckpt_path}")
+
+        if ddp:
+            dist.barrier()
 
     # ── Final save ────────────────────────────────────────────────────
 
     if is_main:
         final_path = Path(args.checkpoint_dir) / "final.pt"
         save_checkpoint(model, optimizer, args.max_steps, model_config, final_path,
-                        r2_bucket=args.r2_bucket, keep_local=True)
+                        r2_bucket=args.r2_bucket, keep_local=True,
+                        upload_executor=upload_executor)
+        if upload_executor is not None:
+            print("Waiting for pending R2 uploads to finish...")
+            upload_executor.shutdown(wait=True)
         print(f"\nTraining complete. Final checkpoint → {final_path}")
         wandb.finish()
 
