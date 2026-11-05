@@ -1,4 +1,4 @@
-# Netra nano — ~16M params · quick sanity checks (minutes on 1 GPU)
+# Netra nano · 15.7M params (12.6M active) · quick sanity checks (minutes on 1 GPU)
 # Usage: python train.py --config configs/nano.yaml
 
 model:

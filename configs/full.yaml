@@ -1,4 +1,4 @@
-# Netra full — ~2B+ params · full-scale training run
+# Netra full · 1.11B params (435M active) · 24 layers, long full-scale run
 # Usage: torchrun --nproc_per_node=8 train.py --config configs/full.yaml
 
 model:
