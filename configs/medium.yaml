@@ -1,4 +1,4 @@
-# Netra medium — ~900M params · serious pretraining (days on 8 GPUs)
+# Netra medium · 1.24B params (488M active) · serious pretraining (days on 8 GPUs)
 # Usage: torchrun --nproc_per_node=8 train.py --config configs/medium.yaml
 
 model:

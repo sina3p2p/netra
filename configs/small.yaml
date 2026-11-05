@@ -1,5 +1,5 @@
-# Netra small — ~280M params · hyperparameter tuning (days on 1 GPU)
-# Usage: torchrun --nproc_per_node=4 train.py --config configs/small.yaml
+# Netra small · 334.5M params (169.4M active) · trained on 8×H100
+# Usage: torchrun --nproc_per_node=8 train.py --config configs/small.yaml
 
 model:
   d_model: 640

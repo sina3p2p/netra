@@ -34,7 +34,7 @@ class ModelConfig:
 
     @classmethod
     def nano(cls, **kwargs):
-        """~16M params · 4 layers · for quick sanity checks (minutes on 1 GPU)."""
+        """15.7M params (12.6M active) · 4 layers · for quick sanity checks (minutes on 1 GPU)."""
         defaults = dict(
             vocab_size=32_000,
             d_model=256, n_layers=4, n_heads=4, d_head=64,
@@ -48,7 +48,7 @@ class ModelConfig:
 
     @classmethod
     def mini(cls, **kwargs):
-        """~65M params · 8 layers (6M+2G) · architecture validation (hours on 1 GPU)."""
+        """65.4M params (46.5M active) · 8 layers (6M+2G) · architecture validation (hours on 1 GPU)."""
         defaults = dict(
             vocab_size=32_000,
             d_model=384, n_layers=8, n_heads=6, d_head=64,
@@ -62,7 +62,7 @@ class ModelConfig:
 
     @classmethod
     def small(cls, **kwargs):
-        """~280M params · 12 layers (9M+3G) · hyperparameter tuning (days on 1 GPU)."""
+        """334.5M params (169.4M active) · 12 layers (9M+3G) · trained on 8×H100."""
         defaults = dict(
             vocab_size=32_000,
             d_model=640, n_layers=12, n_heads=10, d_head=64,
@@ -76,7 +76,7 @@ class ModelConfig:
 
     @classmethod
     def medium(cls, **kwargs):
-        """~900M params · 16 layers (12M+4G) · serious pretraining (days on 8 GPUs)."""
+        """1.24B params (488M active) · 16 layers (12M+4G) · serious pretraining (days on 8 GPUs)."""
         defaults = dict(
             vocab_size=32_000,
             d_model=1024, n_layers=16, n_heads=16, d_head=64,
@@ -90,5 +90,5 @@ class ModelConfig:
 
     @classmethod
     def full(cls, **kwargs):
-        """~2B+ params · 24 layers · full-scale training run."""
+        """Class defaults: 12 layers, 8 experts. See configs/full.yaml for the 24-layer, 1.11B-param run."""
         return cls(**kwargs)

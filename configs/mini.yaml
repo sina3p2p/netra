@@ -1,4 +1,4 @@
-# Netra mini — ~65M params · architecture validation (hours on 1 GPU)
+# Netra mini · 65.4M params (46.5M active) · architecture validation (hours on 1 GPU)
 # Usage: python train.py --config configs/mini.yaml
 
 model:
